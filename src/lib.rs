@@ -45,9 +45,9 @@ use std::io::{self, Read, Write, Cursor, BufRead};
 use std::marker::{Send, Sync};
 use std::mem;
 use std::net::TcpListener;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
+use std::borrow::{Cow,ToOwned};
 
 #[cfg(unix)] use unix::{Transport, Socket};
 #[cfg(unix)] mod unix;
@@ -258,7 +258,7 @@ impl Record {
 }
 
 pub struct Stdin<'a> {
-    req: &'a mut Request,
+    req: &'a mut Request<'a>,
 }
 
 impl<'a> Stdin<'a> {
@@ -348,7 +348,7 @@ impl<'a> Read for Stdin<'a> {
 macro_rules! writer {
     ($Writer:ident) => (
         pub struct $Writer<'a> {
-            req: &'a mut Request,
+            req: &'a mut Request<'a>,
         }
 
         impl<'a> Write for $Writer<'a> {
@@ -387,8 +387,8 @@ writer!(Stderr);
 /// The Request API is designed to be an abstraction of the traditional CGI
 /// process model. Note that this API is low level. Dealing with things like
 /// GET/POST parameters or cookies is outside the scope of this library.
-pub struct Request {
-    sock: Rc<Socket>,
+pub struct Request<'a> {
+    sock: &'a Socket,
     id: u16,
     role: Role,
     params: HashMap<String, String>,
@@ -400,7 +400,7 @@ pub struct Request {
     filter_data: bool,
 }
 
-pub type Params<'a> = Box<Iterator<Item = (String, String)> + 'a>;
+pub type Params<'a> = Box<Iterator<Item = (&'a str, Cow<'a, str>)> + 'a>;
 
 fn get_values(keys: Vec<String>) -> Vec<(String, String)> {
     keys.into_iter().filter_map(|key|
@@ -413,7 +413,7 @@ fn get_values(keys: Vec<String>) -> Vec<(String, String)> {
     ).collect()
 }
 
-impl Request {
+impl <'a> Request<'a> {
     fn begin(mut sock: &Socket) -> io::Result<(u16, Role, bool)> {
         loop {
             match try!(Record::receive(&mut sock)) {
@@ -438,7 +438,7 @@ impl Request {
         }
     }
 
-    fn new(sock: Rc<Socket>, id: u16, role: Role) -> io::Result<Self> {
+    fn new(sock: &'a Socket, id: u16, role: Role) -> io::Result<Self> {
         let mut buf = Vec::new();
         let mut params = HashMap::new();
         let mut aborted = false;
@@ -502,27 +502,27 @@ impl Request {
     }
 
     /// Retrieves the value of the given parameter name.
-    pub fn param(&self, key: &str) -> Option<String> {
-        self.params.get(key).map(|s| s.clone())
+    pub fn param(&'a self, key: &str) -> Option<Cow<'a, str>> {
+        self.params.get(key).map(|s| s.as_str().into())
     }
 
     /// Iterates over the FastCGI parameters.
     pub fn params(&self) -> Params {
-        Box::new(self.params.iter().map(|(k, v)| (k.clone(), v.clone())))
+        Box::new(self.params.iter().map(|(k,v)| (k.as_str(), v.as_str().into())))
     }
 
     /// Standard input stream of the request.
-    pub fn stdin(&mut self) -> Stdin {
+    pub fn stdin(&'a mut self) -> Stdin<'a> {
         Stdin { req: self }
     }
 
     /// Standard output stream of the request.
-    pub fn stdout(&mut self) -> Stdout {
+    pub fn stdout(&'a mut self) -> Stdout<'a> {
         Stdout { req: self }
     }
 
     /// Standard error stream of the request.
-    pub fn stderr(&mut self) -> Stderr {
+    pub fn stderr(&'a mut self) -> Stderr<'a> {
         Stderr { req: self }
     }
 
@@ -546,7 +546,7 @@ impl Request {
     }
 }
 
-impl Drop for Request {
+impl <'a> Drop for Request<'a> {
     fn drop(&mut self) {
         Record::Stdout {
             request_id: self.id,
@@ -587,10 +587,9 @@ fn run_transport<F>(handler: F, transport: &mut Transport) where
         if allow {
             let handler = handler.clone();
             thread::spawn(move || {
-                let sock = Rc::new(sock);
                 loop {
                     let (request_id, role, keep_conn) = Request::begin(&sock).unwrap();
-                    handler(Request::new(sock.clone(), request_id, role).unwrap());
+                    handler(Request::new(&sock, request_id, role).unwrap());
                     if !keep_conn { break; }
                 }
             });
